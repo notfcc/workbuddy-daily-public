@@ -10,7 +10,7 @@ on:
   workflow_dispatch:          # 支持手动触发
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: workbuddy
@@ -34,13 +34,24 @@ jobs:
       - name: Install deps
         run: pip install requests
 
-      - name: Restore benefit guard
-        uses: actions/cache@v4
+      - name: Restore encrypted state
+        uses: actions/cache/restore@v4
         with:
-          path: workbuddy_benefit_state.json
-          key: workbuddy-benefit-state-${{ github.run_id }}
+          path: state.enc
+          key: wb-state-${{ github.run_id }}
           restore-keys: |
-            workbuddy-benefit-state-
+            wb-state-
+
+      - name: Decrypt state
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+        run: |
+          if [ -f state.enc ] && [ -n "$STATE_KEY" ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:STATE_KEY -in state.enc | tar -xz
+            echo "已恢复加密状态"
+          else
+            echo "无历史状态，使用 Secret 中的令牌"
+          fi
 
       - name: Detect account config
         id: config
@@ -101,18 +112,21 @@ jobs:
         if: ${{ always() && steps.config.outputs.cn != 'true' && steps.config.outputs.intl != 'true' }}
         run: echo "::warning::未配置 WORKBUDDY_REFRESH_TOKEN 或 WORKBUDDY_INTL_TOKENS/WORKBUDDY_TOKEN，跳过签到。"
 
-      # ⚠️ 仅在【私有仓库】中持久化令牌/福利期次状态；公开仓库会跳过，避免 RT 泄露
-      - name: Persist runtime state (private repo only)
-        if: always() && github.event.repository.private == true
+      # 公开仓库：令牌库加密后存入 Actions 缓存（缓存不公开，且无 STATE_KEY 无法解密）
+      - name: Encrypt state
+        if: always()
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f wb_refresh_tokens.json 2>/dev/null || true
-          git add -f wb_intl_tokens.json 2>/dev/null || true
-          git add -f workbuddy_benefit_state.json 2>/dev/null || true
-          if git diff --cached --quiet; then
-            echo "运行状态无变化"
-          else
-            git commit -m "chore: 更新运行状态 [skip ci]"
-            git push
+          files=$(ls wb_refresh_tokens.json workbuddy_benefit_state.json workbuddy_activity_state.json workbuddy_sign_retry.json 2>/dev/null || true)
+          if [ -n "$files" ] && [ -n "$STATE_KEY" ]; then
+            tar -cz $files | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:STATE_KEY -out state.enc
+            echo "已加密: $files"
           fi
+
+      - name: Save encrypted state
+        if: always() && hashFiles('state.enc') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state.enc
+          key: wb-state-${{ github.run_id }}
